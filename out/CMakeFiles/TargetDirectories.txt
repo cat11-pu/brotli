@@ -1,0 +1,10 @@
+/home/cat/gsb/uid4124/out/CMakeFiles/brotlicommon.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/brotlidec.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/brotlienc.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/brotli.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/edit_cache.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/rebuild_cache.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/list_install_components.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/install.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/install/local.dir
+/home/cat/gsb/uid4124/out/CMakeFiles/install/strip.dir

@@ -1,0 +1,1 @@
+/usr/bin/cc -DBROTLI_DEC_TRACE -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/brotli.dir/link.d CMakeFiles/brotli.dir/c/tools/brotli.c.o -o brotli  libbrotlienc.a libbrotlidec.a libbrotlicommon.a -lm

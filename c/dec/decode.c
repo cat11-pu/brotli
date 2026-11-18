@@ -179,16 +179,6 @@ static BrotliDecoderErrorCode DecodeWindowBits(BrotliDecoderState* s,
   return BROTLI_DECODER_SUCCESS;
 }
 
-static BROTLI_INLINE void memmove16(uint8_t* dst, uint8_t* src) {
-#if defined(BROTLI_TARGET_NEON)
-  vst1q_u8(dst, vld1q_u8(src));
-#else
-  uint32_t buffer[4];
-  memcpy(buffer, src, 16);
-  memcpy(dst, buffer, 16);
-#endif
-}
-
 /* Decodes a number in the range [0..255], by reading 1 - 11 bits. */
 static BROTLI_NOINLINE BrotliDecoderErrorCode DecodeVarLenUint8(
     BrotliDecoderState* s, BrotliBitReader* br, brotli_reg_t* value) {
@@ -1745,6 +1735,83 @@ static BROTLI_INLINE void TakeDistanceFromRingBuffer(BrotliDecoderState* s) {
   }
 }
 
+static BROTLI_NOINLINE void CopyBackwardReferencePattern(
+    uint8_t* ringbuffer, size_t ringbuffer_mask, size_t dst, size_t src,
+    size_t length, size_t distance) {
+  /* Materialize one page-sized period, then copy it as a batch. A period
+     that is a multiple of |distance| keeps the phase aligned across copies. */
+  uint8_t pattern[4096];
+  size_t pattern_size = length < sizeof(pattern) ? length : sizeof(pattern);
+  size_t period = pattern_size - (pattern_size % distance);
+  size_t i;
+  if (period == 0) period = distance;
+  for (i = 0; i < distance; ++i) {
+    pattern[i] = ringbuffer[(src + i) & ringbuffer_mask];
+  }
+  for (i = distance; i < period; ++i) {
+    pattern[i] = pattern[i - distance];
+  }
+  while (length != 0) {
+    size_t chunk = length < period ? length : period;
+    memcpy(&ringbuffer[dst], pattern, chunk);
+    dst += chunk;
+    length -= chunk;
+  }
+}
+
+/* Overlap-safe 16-byte copy. */
+static BROTLI_INLINE void Copy16(uint8_t* dst, const uint8_t* src) {
+#if defined(BROTLI_TARGET_NEON)
+  vst1q_u8(dst, vld1q_u8(src));
+#else
+  uint32_t buffer[4];
+  memcpy(buffer, src, sizeof(buffer));
+  memcpy(dst, buffer, sizeof(buffer));
+#endif
+}
+
+/* Copies a backward reference inside the ring buffer. |length| must not cross
+   the destination end of the ring buffer. The source is addressed modulo the
+   ring buffer size, so it may wrap independently of the destination. */
+static BROTLI_INLINE void CopyBackwardReference(
+    uint8_t* ringbuffer, size_t ringbuffer_size, size_t ringbuffer_mask,
+    size_t dst, size_t src, size_t length) {
+  const size_t distance = (dst - src) & ringbuffer_mask;
+
+  if (length == 0) return;
+  if (distance == 0) return;
+  if (src + length <= ringbuffer_size && dst + length <= ringbuffer_size &&
+      (src + length <= dst || dst + length <= src)) {
+    memcpy(&ringbuffer[dst], &ringbuffer[src], length);
+    return;
+  }
+  if (distance == 1) {
+    memset(&ringbuffer[dst], ringbuffer[src], length);
+    return;
+  }
+  if (distance <= 256 && length >= 256) {
+    CopyBackwardReferencePattern(ringbuffer, ringbuffer_mask, dst, src, length,
+                                 distance);
+    return;
+  }
+
+  while (length != 0) {
+    size_t chunk = length;
+    size_t dst_room = ringbuffer_size - dst;
+    size_t src_room = ringbuffer_size - src;
+    if (chunk > dst_room) chunk = dst_room;
+    if (chunk > src_room) chunk = src_room;
+    /* Adjacent chunks are non-overlapping when their size is at most the
+       backward distance. */
+    if (src < dst && chunk > distance) chunk = distance;
+    memcpy(&ringbuffer[dst], &ringbuffer[src], chunk);
+    dst += chunk;
+    src += chunk;
+    if (src == ringbuffer_size) src = 0;
+    length -= chunk;
+  }
+}
+
 static BROTLI_INLINE BROTLI_BOOL SafeReadBits(
     BrotliBitReader* const br, brotli_reg_t n_bits, brotli_reg_t* val) {
   if (n_bits != 0) {
@@ -2334,12 +2401,9 @@ CommandPostDecodeLiterals:
     s->dist_rb[s->dist_rb_idx & 3] = s->distance_code;
     ++s->dist_rb_idx;
     s->meta_block_remaining_len -= i;
-    /* There are 32+ bytes of slack in the ring-buffer allocation.
-       Also, we have 16 short codes, that make these 16 bytes irrelevant
-       in the ring-buffer. Let's copy over them as a first guess. */
-    memmove16(copy_dst, copy_src);
+    Copy16(copy_dst, copy_src);
     if (src_end > pos && dst_end > src_start) {
-      /* Regions intersect. */
+      /* Regions intersect; the first 16 bytes will be overwritten. */
       goto CommandPostWrapCopy;
     }
     if (dst_end >= s->ringbuffer_size || src_end >= s->ringbuffer_size) {
@@ -2351,9 +2415,7 @@ CommandPostDecodeLiterals:
       if (i > 32) {
         memcpy(copy_dst + 16, copy_src + 16, (size_t)(i - 16));
       } else {
-        /* This branch covers about 45% cases.
-           Fixed size short copy allows more compiler optimizations. */
-        memmove16(copy_dst + 16, copy_src + 16);
+        Copy16(copy_dst + 16, copy_src + 16);
       }
     }
   }
@@ -2367,15 +2429,17 @@ CommandPostDecodeLiterals:
   }
 CommandPostWrapCopy:
   {
-    int wrap_guard = s->ringbuffer_size - pos;
-    while (--i >= 0) {
-      s->ringbuffer[pos] =
-          s->ringbuffer[(pos - s->distance_code) & s->ringbuffer_mask];
-      ++pos;
-      if (BROTLI_PREDICT_FALSE(--wrap_guard == 0)) {
-        s->state = BROTLI_STATE_COMMAND_POST_WRITE_2;
-        goto saveStateAndReturn;
-      }
+    int chunk = s->ringbuffer_size - pos;
+    int src_start = (pos - s->distance_code) & s->ringbuffer_mask;
+    if (i < chunk) chunk = i;
+    CopyBackwardReference(s->ringbuffer, (size_t)s->ringbuffer_size,
+                          (size_t)s->ringbuffer_mask, (size_t)pos,
+                          (size_t)src_start, (size_t)chunk);
+    pos += chunk;
+    i -= chunk;
+    if (chunk > 0 && pos == s->ringbuffer_size) {
+      s->state = BROTLI_STATE_COMMAND_POST_WRITE_2;
+      goto saveStateAndReturn;
     }
   }
   if (s->meta_block_remaining_len <= 0) {

@@ -243,11 +243,11 @@ int BrotliTransformDictionaryWord(uint8_t* dst, const uint8_t* word, int len,
   const uint8_t* suffix = BROTLI_TRANSFORM_SUFFIX(transforms, transform_idx);
   {
     int prefix_len = *prefix++;
-    while (prefix_len--) { dst[idx++] = *prefix++; }
+    memcpy(&dst[idx], prefix, (size_t)prefix_len);
+    idx += prefix_len;
   }
   {
     const int t = type;
-    int i = 0;
     if (t <= BROTLI_TRANSFORM_OMIT_LAST_9) {
       len -= t;
     } else if (t >= BROTLI_TRANSFORM_OMIT_FIRST_1
@@ -256,7 +256,10 @@ int BrotliTransformDictionaryWord(uint8_t* dst, const uint8_t* word, int len,
       word += skip;
       len -= skip;
     }
-    while (i < len) { dst[idx++] = word[i++]; }
+    if (len > 0) {
+      memcpy(&dst[idx], word, (size_t)len);
+      idx += len;
+    }
     if (t == BROTLI_TRANSFORM_UPPERCASE_FIRST) {
       ToUpperCase(&dst[idx - len]);
     } else if (t == BROTLI_TRANSFORM_UPPERCASE_ALL) {
@@ -283,7 +286,8 @@ int BrotliTransformDictionaryWord(uint8_t* dst, const uint8_t* word, int len,
   }
   {
     int suffix_len = *suffix++;
-    while (suffix_len--) { dst[idx++] = *suffix++; }
+    memcpy(&dst[idx], suffix, (size_t)suffix_len);
+    idx += suffix_len;
     return idx;
   }
 }
